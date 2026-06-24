@@ -1,0 +1,28 @@
+# virtual env
+venv/
+.venv/
+
+# local CUDA toolchain env (created by install_gpu.ps1)
+.cuda/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# training artifacts
+models/
+outputs/
+*.h5
+*.keras
+
+# dataset folders (often large / Google-Drive exports)
+train/
+val/
+test/
+train-*/
+val-*/
+test-*/
+
+# notebooks checkpoints
+.ipynb_checkpoints/

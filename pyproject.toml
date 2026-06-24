@@ -1,0 +1,22 @@
+[project]
+name = "chest-xray-classifier"
+version = "0.1.0"
+description = "4-class chest X-ray classification with DenseNet121 (CheXNet-style)"
+readme = "README.md"
+# TensorFlow 2.10 (last native-Windows-GPU release) supports Python 3.7-3.10.
+requires-python = ">=3.10,<3.11"
+dependencies = [
+    "tensorflow==2.10.1",
+    # 0.31.0 is the last release with a Windows wheel (newer ones are Linux/macOS only).
+    "tensorflow-io-gcs-filesystem==0.31.0",
+    "numpy<1.24",
+    "scikit-learn",
+    "matplotlib",
+    "seaborn",
+    "Pillow",
+    "tqdm>=4.68.3",
+]
+
+# This is an application, not an importable library, so don't try to build/install it.
+[tool.uv]
+package = false
