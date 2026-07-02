@@ -22,14 +22,20 @@ The pipeline auto-detects the dataset classes from `train/`, `val/`, and
 ```
 
 ### Dataset
-Each split folder contains one sub-folder per class:
+Point the pipeline at your data with the `CXR_DATA_ROOT` environment variable.
+Two layouts are supported:
 
-```
-train/<ClassName>/*.png      val/<ClassName>/*.png      test/<ClassName>/*.png
-```
+- **Already split** — a folder with `train/`, `val/`, `test/`, each holding one
+  sub-folder per class:
+  ```
+  train/<ClassName>/*.png   val/<ClassName>/*.png   test/<ClassName>/*.png
+  ```
+- **Single root of class folders** — one sub-folder per class; the pipeline
+  creates a stratified 80/10/10 split under `_prepared_splits/` on first run.
 
-The split folders are **auto-detected**, so the messy Google-Drive export
-names (e.g. `train-20260620T...-001/train`) work as-is — no need to rename.
+```powershell
+$env:CXR_DATA_ROOT = "D:\data\chest-xray"   # override; defaults to the project root
+```
 
 ## Setup
 
@@ -54,9 +60,9 @@ conda install -c conda-forge cudatoolkit=11.2 cudnn=8.1.0
 uv pip install -e .
 ```
 
-Without CUDA/cuDNN it runs on **CPU** (slower but works). The 4 GB GTX 1650
-is handled by `BATCH_SIZE=16` in `config.py` and GPU memory-growth in `main.py`;
-drop the batch size to 8 if you hit out-of-memory.
+Without CUDA/cuDNN it runs on **CPU** (slower but works). Batch size defaults to
+`32`; override with `CXR_BATCH_SIZE` and drop it to `16`/`8` on a small GPU
+(e.g. a 4 GB GTX 1650). GPU memory-growth is enabled in `main.py`.
 
 ## Usage
 
@@ -70,16 +76,25 @@ All settings — epochs, batch size, learning rates, fine-tuning depth — live 
 out-of-memory).
 
 ## Outputs
-- `models/densenet121_chestxray.h5` — best model (by validation accuracy)
-- `outputs/training_history.png` — accuracy / loss curves
+- `models/densenet121_chestxray.keras` — best model (lowest validation loss)
+- `outputs/training_history.png` — accuracy / loss / AUC curves
 - `outputs/confusion_matrix.png` — test-set confusion matrix
 - `outputs/classification_report.txt` — per-class precision/recall/F1
 
-## What changed vs. the original notebook
-- One clean, reproducible architecture (DenseNet121) instead of two competing
-  ones; dropped the heavier DenseNet+ResNet fusion to keep it focused.
-- Correct DenseNet `preprocess_input` instead of `rescale=1./255` (matters for
-  ImageNet transfer learning).
-- Two-phase training (frozen head → fine-tune) with BatchNorm kept frozen.
-- Proper test evaluation: classification report + confusion matrix, not just accuracy.
-- The one-off `train_test_split` copy step is removed — the data is already split.
+## Design notes (best practices)
+- **Backbone + light head.** DenseNet121 → global average pool → dropout →
+  softmax (the CheXNet baseline). No attention blocks or deep dense head — a
+  small dataset can't support them without overfitting.
+- **Correct preprocessing.** DenseNet `preprocess_input`, not `rescale=1./255`.
+- **CXR-safe augmentation.** Small rotations (±10°), zoom, shift and mild
+  intensity jitter via Keras layers. **No** 90° rotations or left/right flips —
+  both are anatomically impossible for a chest film (a flip mislocates the
+  heart, which matters for Cardiomegaly).
+- **Two-phase training.** Frozen head → fine-tune only the last dense block,
+  with backbone BatchNorm kept in inference mode.
+- **One LR controller per phase.** ReduceLROnPlateau (warm-up) then cosine decay
+  matched to the fine-tune length — no two schedulers fighting.
+- **Sensible metrics.** Accuracy + macro AUC during training; per-class
+  precision/recall/F1 from the test-set classification report.
+- **Class weighting.** Inverse-frequency weights handle label imbalance.
+- **Portable checkpoint.** Saved in the native `.keras` format.

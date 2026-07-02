@@ -21,8 +21,15 @@ def main():
     train_ds, val_ds, test_ds, class_names = data.build_datasets()
     print("Classes:", class_names)
 
+    class_weight = data.compute_class_weights(class_names)
+    print("Class weights:", class_weight)
+
     model, base = model_mod.build_model(len(class_names))
-    histories = train_mod.train(model, base, train_ds, val_ds, finetune=config.EPOCHS_FINETUNE > 0)
+    histories = train_mod.train(
+        model, base, train_ds, val_ds,
+        finetune=config.EPOCHS_FINETUNE > 0,
+        class_weight=class_weight,
+    )
     train_mod.plot_history(histories)
 
     if config.BEST_MODEL_PATH.exists():
