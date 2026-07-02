@@ -13,16 +13,14 @@ def _split_dir(name: str) -> Path:
 
 TRAIN_DIR, VAL_DIR, TEST_DIR = _split_dir("train"), _split_dir("val"), _split_dir("test")
 
-CLASS_NAMES = ["Edema", "Nodule Mass", "Normal", "Pneumonia"]
-NUM_CLASSES = len(CLASS_NAMES)
 IMG_SIZE = (224, 224)
 BATCH_SIZE = 16          # fits a 4 GB GPU (GTX 1650); raise if you have more VRAM
 SEED = 42
 
-EPOCHS_FROZEN, LR_FROZEN = 3, 1e-4         # phase 1: short head warmup (frozen backbone)
-EPOCHS_FINETUNE, LR_FINETUNE = 30, 1e-5    # phase 2: the real training — fine-tune the backbone
-FINE_TUNE_AT = 140                         # unfreeze ~last 2 dense blocks (incl. BatchNorm)
-LABEL_SMOOTHING = 0.1                      # NIH labels are noisy; smoothing regularizes
+EPOCHS_FROZEN, LR_FROZEN = 5, 1e-4         # phase 1: warmup head training (backbone frozen)
+EPOCHS_FINETUNE, LR_FINETUNE = 25, 1e-5    # phase 2: fine-tune the backbone
+FINE_TUNE_AT = 140                         # unfreeze top ~2 dense blocks
+LABEL_SMOOTHING = 0.1                      # regularize noisy labels
 
 MODELS_DIR = ROOT / "models"
 OUTPUTS_DIR = ROOT / "outputs"

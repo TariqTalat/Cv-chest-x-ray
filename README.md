@@ -1,8 +1,8 @@
-# Chest X-ray Classification (4 classes)
+# Chest X-ray Classification
 
-Classifies chest X-ray images into **Edema**, **Nodule Mass**, **Normal**,
-**Pneumonia** using transfer learning with **DenseNet121** (the backbone used
-by *CheXNet*, the reference model for NIH chest X-rays).
+Classifies chest X-ray images using transfer learning with **DenseNet121**.
+The pipeline auto-detects the dataset classes from `train/`, `val/`, and
+`test/` folders, so it adapts to the actual labels you provide.
 
 ## Project layout
 
