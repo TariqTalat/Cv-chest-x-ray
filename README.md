@@ -13,9 +13,7 @@ The pipeline auto-detects the dataset classes from `train/`, `val/`, and
 ├── src/
 │   ├── config.py           # paths, classes, hyper-parameters (edit here)
 │   ├── data.py             # tf.data pipeline + augmentation + preprocessing
-│   ├── model.py            # DenseNet121 backbone + classifier head
-│   ├── train.py            # 2-phase training + training curves
-│   └── evaluate.py         # accuracy, classification report, confusion matrix
+│   └── pipeline.py         # DenseNet121 model + 2-phase training + evaluation
 ├── models/                 # best model checkpoint (created on first run)
 ├── outputs/                # plots + reports (created on first run)
 └── train/ val/ test/       # dataset (auto-detected, see below)

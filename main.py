@@ -2,15 +2,30 @@
 
 All settings live in src/config.py. Just run:  uv run python main.py
 """
-from src.gpu import enable_cuda_dlls
+import os
+from pathlib import Path
 
-enable_cuda_dlls()  # must run before TensorFlow is imported (no-op without a local CUDA env)
+ROOT = Path(__file__).resolve().parent
+
+
+def _enable_cuda_dlls():
+    """Make a local conda CUDA 11.2 / cuDNN 8.1 toolchain visible to TF 2.10 on Windows.
+
+    TF 2.10 (last native-Windows-GPU build) doesn't auto-discover CUDA DLLs, so we
+    add them to the search path *before* importing TensorFlow. No-op elsewhere.
+    """
+    for cand in (os.environ.get("CUDA_DLL_DIR"), ROOT / ".cuda" / "Library" / "bin"):
+        if cand and Path(cand).is_dir() and hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(str(cand))
+            os.environ["PATH"] = f"{cand}{os.pathsep}{os.environ.get('PATH', '')}"
+            return
+
+
+_enable_cuda_dlls()  # must run before TensorFlow is imported
 
 import tensorflow as tf
 
-from src import config, data, evaluate
-from src import model as model_mod
-from src import train as train_mod
+from src import config, data, pipeline
 
 
 def main():
@@ -24,17 +39,17 @@ def main():
     class_weight = data.compute_class_weights(class_names)
     print("Class weights:", class_weight)
 
-    model, base = model_mod.build_model(len(class_names))
-    histories = train_mod.train(
+    model, base = pipeline.build_model(len(class_names))
+    histories = pipeline.train(
         model, base, train_ds, val_ds,
         finetune=config.EPOCHS_FINETUNE > 0,
         class_weight=class_weight,
     )
-    train_mod.plot_history(histories)
+    pipeline.plot_history(histories)
 
     if config.BEST_MODEL_PATH.exists():
         model = tf.keras.models.load_model(config.BEST_MODEL_PATH)
-    evaluate.evaluate(model, test_ds, class_names)
+    pipeline.evaluate(model, test_ds, class_names)
 
 
 if __name__ == "__main__":

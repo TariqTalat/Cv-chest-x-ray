@@ -1,7 +1,7 @@
 [project]
 name = "chest-xray-classifier"
 version = "0.1.0"
-description = "4-class chest X-ray classification with DenseNet121 (CheXNet-style)"
+description = "Chest X-ray classification with DenseNet121 (CheXNet-style)"
 readme = "README.md"
 # TensorFlow 2.10 (last native-Windows-GPU release) supports Python 3.7-3.10.
 requires-python = ">=3.10,<3.11"

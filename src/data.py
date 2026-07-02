@@ -22,7 +22,6 @@ _augment = tf.keras.Sequential(
         layers.RandomZoom(0.1, fill_mode="constant"),
         layers.RandomTranslation(0.05, 0.05, fill_mode="constant"),
         layers.RandomContrast(0.1),
-        layers.RandomBrightness(0.1, value_range=(0.0, 255.0)),
     ],
     name="cxr_augment",
 )
@@ -43,6 +42,24 @@ def _load(directory, shuffle):
 
 def build_datasets():
     """Return (train, val, test, class_names) datasets."""
+    # Quick sanity check: ensure the prepared train dir contains images
+    def _count_images_in_dir(directory):
+        counts = {}
+        for path in sorted(directory.iterdir()):
+            if not path.is_dir() or path.name.startswith("_"):
+                continue
+            n = sum(1 for p in path.rglob("*") if p.is_file() and p.suffix.lower() in config.IMAGE_SUFFIXES)
+            counts[path.name] = n
+        return counts
+
+    train_counts = _count_images_in_dir(config.TRAIN_DIR)
+    total_train = sum(train_counts.values())
+    if total_train == 0:
+        raise FileNotFoundError(
+            f"No images found in prepared train folder: {config.TRAIN_DIR}\n"
+            f"Check your CXR_DATA_ROOT or provide a pre-split dataset. Detected class folders: {list(train_counts.items())}"
+        )
+
     train = _load(config.TRAIN_DIR, True)
     val = _load(config.VAL_DIR, False)
     test = _load(config.TEST_DIR, False)
@@ -52,7 +69,9 @@ def build_datasets():
         return preprocess_input(x), y
 
     def augment_fn(x, y):
+        x = tf.cast(x, tf.float32)
         x = _augment(x, training=True)
+        x = tf.image.random_brightness(x, max_delta=15.0)
         x = tf.clip_by_value(x, 0.0, 255.0)
         return preprocess_input(x), y
 
