@@ -1,55 +1,29 @@
 """Run the chest X-ray pipeline: train (2 phases) + evaluate.
 
-All settings live in src/config.py. Just run:  uv run python main.py
+All settings live in src/config.py. Just run:  python main.py
 """
-import os
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent
-
-
-def _enable_cuda_dlls():
-    """Make a local conda CUDA 11.2 / cuDNN 8.1 toolchain visible to TF 2.10 on Windows.
-
-    TF 2.10 (last native-Windows-GPU build) doesn't auto-discover CUDA DLLs, so we
-    add them to the search path *before* importing TensorFlow. No-op elsewhere.
-    """
-    for cand in (os.environ.get("CUDA_DLL_DIR"), ROOT / ".cuda" / "Library" / "bin"):
-        if cand and Path(cand).is_dir() and hasattr(os, "add_dll_directory"):
-            os.add_dll_directory(str(cand))
-            os.environ["PATH"] = f"{cand}{os.pathsep}{os.environ.get('PATH', '')}"
-            return
-
-
-_enable_cuda_dlls()  # must run before TensorFlow is imported
-
-import tensorflow as tf
+import torch
 
 from src import config, data, pipeline
 
 
 def main():
-    for gpu in tf.config.list_physical_devices("GPU"):
-        tf.config.experimental.set_memory_growth(gpu, True)  # don't grab all VRAM on a small GPU
-    print(f"TensorFlow {tf.__version__} | GPU: {bool(tf.config.list_physical_devices('GPU'))}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"PyTorch {torch.__version__} | device: {device}")
 
-    train_ds, val_ds, test_ds, class_names = data.build_datasets()
+    train_loader, val_loader, test_loader, class_names = data.build_loaders()
     print("Classes:", class_names)
 
-    class_weight = data.compute_class_weights(class_names)
-    print("Class weights:", class_weight)
+    weight = data.class_weights(class_names)
+    print("Class weights:", {n: round(w, 3) for n, w in zip(class_names, weight.tolist())})
 
-    model, base = pipeline.build_model(len(class_names))
-    histories = pipeline.train(
-        model, base, train_ds, val_ds,
-        finetune=config.EPOCHS_FINETUNE > 0,
-        class_weight=class_weight,
-    )
-    pipeline.plot_history(histories)
+    model = pipeline.CXRClassifier(len(class_names)).to(device)
+    history = pipeline.train(model, train_loader, val_loader, device, weight, len(class_names))
+    pipeline.plot_history(history)
 
     if config.BEST_MODEL_PATH.exists():
-        model = tf.keras.models.load_model(config.BEST_MODEL_PATH, compile=False)
-    pipeline.evaluate(model, test_ds, class_names)
+        model.load_state_dict(torch.load(config.BEST_MODEL_PATH, map_location=device))
+    pipeline.evaluate(model, test_loader, class_names, device)
 
 
 if __name__ == "__main__":

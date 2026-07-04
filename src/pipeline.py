@@ -1,30 +1,28 @@
 """Model, two-phase training, and evaluation for the chest X-ray classifier.
 
-Architecture is the proven CheXNet-style baseline: a DenseNet121 backbone
-(ImageNet) with a light global-pool head. The lever that actually matters on a
-small dataset is the *training recipe*, not head complexity:
+Backbone: a DenseNet121 pretrained on 100k+ chest X-rays via TorchXRayVision —
+its features already encode findings like Nodule/Mass/Cardiomegaly, which is the
+whole point of switching away from ImageNet. We attach a light 3-class head:
 
-  Phase 1  warm up the head with the backbone frozen (high LR).
-  Phase 2  fine-tune the last dense blocks with a low, cosine-decayed LR.
+  Phase 1  freeze the backbone, warm up the head.
+  Phase 2  fine-tune the last two dense blocks with a low, cosine-decayed LR.
 
-Backbone BatchNorm always runs in inference mode (``training=False``), so its
-ImageNet running statistics stay frozen even while conv weights are fine-tuned —
-the recommended setup for transfer learning on limited data.
+The backbone runs in eval mode throughout (``features.eval()``) so its
+pretrained BatchNorm statistics stay fixed — the standard transfer-learning
+setup on a small dataset.
 """
-import math
-
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
-import tensorflow as tf
-from sklearn.metrics import classification_report, confusion_matrix
-from tensorflow.keras import Model, layers
-from tensorflow.keras import callbacks as cb
-from tensorflow.keras.applications import DenseNet121
-from tqdm.keras import TqdmCallback
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchxrayvision as xrv
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from tqdm import tqdm
 
 from . import config
 
@@ -32,113 +30,165 @@ from . import config
 # --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
-def build_model(num_classes: int):
-    """Return ``(model, base)``; ``base`` is exposed so it can be unfrozen later."""
-    base = DenseNet121(weights="imagenet", include_top=False, input_shape=(*config.IMG_SIZE, 3))
-    base.trainable = False
+class CXRClassifier(nn.Module):
+    """TorchXRayVision DenseNet121 features + global-pool + linear head."""
 
-    inputs = layers.Input((*config.IMG_SIZE, 3))
-    x = base(inputs, training=False)          # keep backbone BatchNorm in inference mode
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dropout(0.4)(x)
-    outputs = layers.Dense(num_classes, activation="softmax")(x)
-    return Model(inputs, outputs, name="densenet121_cxr"), base
+    def __init__(self, num_classes: int):
+        super().__init__()
+        backbone = xrv.models.DenseNet(weights=config.XRV_WEIGHTS)
+        self.features = backbone.features
+        feat_dim = getattr(backbone.classifier, "in_features", 1024)
+        self.dropout = nn.Dropout(config.DROPOUT)
+        self.classifier = nn.Linear(feat_dim, num_classes)
+
+    def forward(self, x):
+        f = F.relu(self.features(x), inplace=True)
+        f = F.adaptive_avg_pool2d(f, 1).flatten(1)
+        return self.classifier(self.dropout(f))
 
 
-def unfreeze(base, from_block=config.FINE_TUNE_FROM):
-    """Unfreeze the backbone from the given dense block onward (e.g. ``"conv4"``)."""
-    base.trainable = True
-    trainable = False
-    for layer in base.layers:
-        if layer.name.startswith(from_block):
-            trainable = True
-        layer.trainable = trainable
+def _freeze_backbone(model):
+    for p in model.features.parameters():
+        p.requires_grad = False
+
+
+def _unfreeze_finetune(model):
+    """Unfreeze only the last dense blocks (config.FINETUNE_PREFIXES)."""
+    for name, p in model.features.named_parameters():
+        p.requires_grad = name.startswith(config.FINETUNE_PREFIXES)
+
+
+def _set_mode(model, training: bool):
+    model.train(training)      # toggles head dropout
+    model.features.eval()      # always use the pretrained BatchNorm statistics
 
 
 # --------------------------------------------------------------------------- #
-# Training
+# Loss
 # --------------------------------------------------------------------------- #
-def categorical_focal_loss(gamma):
-    """Softmax focal loss — down-weights easy examples (1 - p)^gamma so training
-    focuses on the hard, misclassified cases instead of coasting on easy ones."""
-    def loss(y_true, y_pred):
-        y_true = tf.cast(y_true, y_pred.dtype)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        ce = -y_true * tf.math.log(y_pred)
-        return tf.reduce_sum(tf.pow(1.0 - y_pred, gamma) * ce, axis=-1)
-    return loss
+def _make_criterion(weight):
+    """Weighted cross-entropy, or focal loss when config.FOCAL_GAMMA > 0."""
+    if config.FOCAL_GAMMA > 0:
+        gamma = config.FOCAL_GAMMA
+
+        def focal(logits, y):
+            logp = F.log_softmax(logits, dim=1)
+            ce = F.nll_loss(logp, y, weight=weight, reduction="none")
+            pt = logp.gather(1, y[:, None]).squeeze(1).exp()
+            return ((1.0 - pt) ** gamma * ce).mean()
+
+        return focal
+    return nn.CrossEntropyLoss(weight=weight, label_smoothing=config.LABEL_SMOOTHING)
 
 
-def _compile(model, lr):
-    """Accuracy + macro AUC. Per-class precision/recall come from evaluate()."""
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss=categorical_focal_loss(config.FOCAL_GAMMA),
-        metrics=["accuracy", tf.keras.metrics.AUC(name="auc", multi_label=True)],
-    )
+# --------------------------------------------------------------------------- #
+# Training / evaluation loop
+# --------------------------------------------------------------------------- #
+def _run_epoch(model, loader, device, criterion, optimizer=None):
+    training = optimizer is not None
+    _set_mode(model, training)
+    total_loss, probs, targets = 0.0, [], []
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        with torch.set_grad_enabled(training):
+            logits = model(x)
+            loss = criterion(logits, y)
+            if training:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        total_loss += loss.item() * x.size(0)
+        probs.append(torch.softmax(logits, dim=1).detach().cpu())
+        targets.append(y.cpu())
+    probs = torch.cat(probs).numpy()
+    targets = torch.cat(targets).numpy()
+    return total_loss / len(targets), probs, targets
 
 
-def _callbacks(phase):
-    """One learning-rate controller per phase — never a scheduler *and* a plateau reducer."""
-    config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    # Monitor val AUC (not val_loss): threshold-free and robust to label
-    # smoothing, so fine-tuning isn't cut short by a noisy loss curve.
-    cbs = [
-        cb.ModelCheckpoint(str(config.BEST_MODEL_PATH), monitor="val_auc",
-                           mode="max", save_best_only=True, verbose=0),
-        cb.EarlyStopping(monitor="val_auc", mode="max", patience=10,
-                         restore_best_weights=True, verbose=1),
-        TqdmCallback(verbose=1),
-    ]
-    if phase == "finetune":
-        cbs.insert(0, cb.LearningRateScheduler(
-            lambda epoch, lr: config.LR_FINETUNE * 0.5
-            * (1.0 + math.cos(math.pi * epoch / max(config.EPOCHS_FINETUNE, 1)))))
-    else:
-        cbs.insert(0, cb.ReduceLROnPlateau(monitor="val_loss", factor=0.3,
-                                           patience=2, min_lr=1e-7, verbose=1))
-    return cbs
+def _macro_auc(targets, probs, n_classes):
+    try:
+        return roc_auc_score(targets, probs, multi_class="ovr",
+                             average="macro", labels=list(range(n_classes)))
+    except ValueError:
+        return float("nan")
 
 
-def _fit(model, train_ds, val_ds, epochs, phase, class_weight):
-    return model.fit(train_ds, validation_data=val_ds, epochs=epochs,
-                     callbacks=_callbacks(phase), class_weight=class_weight, verbose=0)
+def _fit_phase(model, phase, epochs, lr, train_loader, val_loader, device,
+               criterion, n_classes, history):
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=config.WEIGHT_DECAY)
+    scheduler = (torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+                 if phase == "finetune" else None)
+
+    best_auc, best_state, since_improved = -1.0, None, 0
+    bar = tqdm(range(1, epochs + 1), desc=f"{phase}", unit="epoch")
+    for _ in bar:
+        tr_loss, tr_probs, tr_targets = _run_epoch(model, train_loader, device, criterion, optimizer)
+        va_loss, va_probs, va_targets = _run_epoch(model, val_loader, device, criterion)
+        if scheduler:
+            scheduler.step()
+
+        tr_acc = (tr_probs.argmax(1) == tr_targets).mean()
+        va_acc = (va_probs.argmax(1) == va_targets).mean()
+        va_auc = _macro_auc(va_targets, va_probs, n_classes)
+        history["acc"].append(tr_acc); history["val_acc"].append(va_acc)
+        history["loss"].append(tr_loss); history["val_loss"].append(va_loss)
+        history["auc"].append(_macro_auc(tr_targets, tr_probs, n_classes))
+        history["val_auc"].append(va_auc)
+        bar.set_postfix(loss=f"{tr_loss:.3f}", acc=f"{tr_acc:.3f}",
+                        val_acc=f"{va_acc:.3f}", val_auc=f"{va_auc:.3f}")
+
+        if va_auc > best_auc:
+            best_auc, best_state, since_improved = va_auc, _cpu_state(model), 0
+        else:
+            since_improved += 1
+            if since_improved >= config.EARLY_STOP_PATIENCE:
+                print(f"Early stopping ({phase}) — best val AUC {best_auc:.4f}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        torch.save(best_state, config.BEST_MODEL_PATH)
 
 
-def train(model, base, train_ds, val_ds, finetune=True, class_weight=None):
-    """Phase 1: train the head (backbone frozen). Phase 2: fine-tune the backbone."""
+def _cpu_state(model):
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def train(model, train_loader, val_loader, device, weight, n_classes):
+    """Phase 1: train the head. Phase 2: fine-tune the last dense blocks."""
+    criterion = _make_criterion(weight.to(device))
+    history = {k: [] for k in ("acc", "val_acc", "loss", "val_loss", "auc", "val_auc")}
+
     print("\n" + "=" * 70 + "\n=== Phase 1: Training classifier head (backbone frozen) ===\n" + "=" * 70)
-    _compile(model, config.LR_FROZEN)
-    histories = [_fit(model, train_ds, val_ds, config.EPOCHS_FROZEN, "frozen", class_weight)]
+    _freeze_backbone(model)
+    _fit_phase(model, "frozen", config.EPOCHS_FROZEN, config.LR_FROZEN,
+               train_loader, val_loader, device, criterion, n_classes, history)
 
-    if finetune:
-        print("\n" + "=" * 70 + f"\n=== Phase 2: Fine-tuning the backbone (from {config.FINE_TUNE_FROM}) ===\n" + "=" * 70)
-        unfreeze(base)
-        _compile(model, config.LR_FINETUNE)
-        histories.append(_fit(model, train_ds, val_ds, config.EPOCHS_FINETUNE, "finetune", class_weight))
+    if config.EPOCHS_FINETUNE > 0:
+        print("\n" + "=" * 70 + "\n=== Phase 2: Fine-tuning the last dense blocks ===\n" + "=" * 70)
+        _unfreeze_finetune(model)
+        _fit_phase(model, "finetune", config.EPOCHS_FINETUNE, config.LR_FINETUNE,
+                   train_loader, val_loader, device, criterion, n_classes, history)
 
-    return histories
+    return history
 
 
-def plot_history(histories):
+def plot_history(history):
     """Save train/val curves for accuracy, loss and AUC."""
     config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    pick = lambda key: [v for h in histories for v in h.history.get(key, [])]
-
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    for ax, (metric, title) in zip(axes.flat, [("accuracy", "Accuracy"), ("loss", "Loss"), ("auc", "AUC")]):
-        train_vals = pick(metric)
+    for ax, (metric, title) in zip(axes.flat, [("acc", "Accuracy"), ("loss", "Loss"), ("auc", "AUC")]):
+        train_vals = history[metric]
         if not train_vals:
             continue
         epochs = range(1, len(train_vals) + 1)
         ax.plot(epochs, train_vals, label="train", linewidth=2)
-        val_vals = pick("val_" + metric)
-        if val_vals:
-            ax.plot(epochs, val_vals, label="val", linewidth=2)
+        ax.plot(epochs, history["val_" + metric], label="val", linewidth=2)
         ax.set(title=title, xlabel="Epoch", ylabel=title)
         ax.legend()
         ax.grid(True, alpha=0.3)
-
     fig.tight_layout()
     out = config.OUTPUTS_DIR / "training_history.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
@@ -149,14 +199,21 @@ def plot_history(histories):
 # --------------------------------------------------------------------------- #
 # Evaluation
 # --------------------------------------------------------------------------- #
-def evaluate(model, test_ds, class_names):
+@torch.no_grad()
+def evaluate(model, test_loader, class_names, device):
     """Evaluate on the test set; write report + confusion matrix to outputs/."""
     config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    y_true = np.concatenate([y.numpy() for _, y in test_ds]).argmax(1)
-    y_pred = model.predict(test_ds, verbose=0).argmax(1)
-    acc = float((y_true == y_pred).mean())
-    print(f"\nTest accuracy: {acc:.4f}")
+    _set_mode(model, False)
+    probs, targets = [], []
+    for x, y in test_loader:
+        probs.append(torch.softmax(model(x.to(device)), dim=1).cpu())
+        targets.append(y)
+    y_prob = torch.cat(probs).numpy()
+    y_true = torch.cat(targets).numpy()
+    y_pred = y_prob.argmax(1)
 
+    acc = float((y_pred == y_true).mean())
+    print(f"\nTest accuracy: {acc:.4f}")
     report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
     print("\n" + report)
     (config.OUTPUTS_DIR / "classification_report.txt").write_text(

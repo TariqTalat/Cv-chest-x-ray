@@ -55,16 +55,29 @@ def _prepare_splits(class_dirs) -> tuple[Path, Path, Path]:
 
 TRAIN_DIR, VAL_DIR, TEST_DIR = _prepare_splits(CLASS_DIRS)
 
-# --- Hyper-parameters ------------------------------------------------------
-IMG_SIZE = (320, 320)                    # bigger input = more pixels on small nodules/masses
-BATCH_SIZE = int(os.environ.get("CXR_BATCH_SIZE", 32))   # drop to 16/8 on a small GPU
+# --- Model -----------------------------------------------------------------
+# DenseNet121 pretrained on 100k+ chest X-rays (NIH/CheXpert/etc.). Its native
+# label set already includes Nodule, Mass and Cardiomegaly, so the backbone
+# starts out knowing what these findings look like — unlike ImageNet.
+XRV_WEIGHTS = "densenet121-res224-all"
+IMG_SIZE = 224          # the xrv weights are trained at 224x224
+DROPOUT = 0.4
 
-EPOCHS_FROZEN, LR_FROZEN = 8, 1e-3       # phase 1: warm up the classifier head fast
-EPOCHS_FINETUNE, LR_FINETUNE = 30, 1e-4  # phase 2: adapt the backbone to X-rays
-FINE_TUNE_FROM = "conv3"                 # unfreeze DenseNet121's last three dense blocks (conv3-5)
-FOCAL_GAMMA = 2.0                        # focal loss: focus training on hard cases (subtle nodules)
-CLASS_WEIGHT_BOOST = {"Nodule_Mass": 2.0}  # over-weight the under-predicted class to lift its recall
+# --- Training --------------------------------------------------------------
+BATCH_SIZE = int(os.environ.get("CXR_BATCH_SIZE", 32))   # drop to 16/8 on a small GPU
+NUM_WORKERS = int(os.environ.get("CXR_WORKERS", 4))
+
+EPOCHS_FROZEN, LR_FROZEN = 10, 1e-3      # phase 1: warm up the classifier head
+EPOCHS_FINETUNE, LR_FINETUNE = 60, 1e-4  # phase 2: fine-tune the last dense blocks
+WEIGHT_DECAY = 1e-4
+EARLY_STOP_PATIENCE = 12
+LABEL_SMOOTHING = 0.1
+FOCAL_GAMMA = 0.0        # 0 = plain (weighted) cross-entropy; >0 enables focal loss
+CLASS_WEIGHT_BOOST: dict[str, float] = {}   # e.g. {"Nodule_Mass": 1.5} to over-weight a class
+
+# Fine-tune the last three dense blocks (domain backbone + small data).
+FINETUNE_PREFIXES = ("denseblock2", "transition2", "denseblock3", "transition3", "denseblock4", "norm5")
 
 MODELS_DIR = ROOT / "models"
 OUTPUTS_DIR = ROOT / "outputs"
-BEST_MODEL_PATH = MODELS_DIR / "densenet121_chestxray.keras"
+BEST_MODEL_PATH = MODELS_DIR / "densenet121_xrv_chestxray.pt"

@@ -1,102 +1,76 @@
-"""tf.data input pipeline with CXR-safe augmentation and DenseNet preprocessing.
+"""PyTorch input pipeline with CXR-safe augmentation and TorchXRayVision preprocessing.
 
-Augmentation is intentionally anatomy-preserving: only small rotations, zoom,
-shifts and mild intensity jitter. We deliberately do **not** use 90° rotations
-or left/right flips — a sideways/mirrored chest film never occurs in reality,
-and a horizontal flip mislocates the heart, which is exactly wrong for a class
-like Cardiomegaly.
+TorchXRayVision models expect a single-channel image normalized to the
+[-1024, 1024] range (their ``xrv.datasets.normalize(img, 255)`` maps [0, 255] to
+[-1024, 1024], i.e. ``pixel/255 * 2048 - 1024``). We reproduce that exactly with
+a final ``t * 2048 - 1024`` step after ``ToTensor``.
+
+Augmentation is intentionally anatomy-preserving: only small rotations, shifts,
+zoom and mild intensity jitter. We deliberately do **not** use flips or 90°
+rotations — a mirrored chest film moves the heart to the wrong side, which is
+exactly wrong for a class like Cardiomegaly.
 """
-import tensorflow as tf
-from tensorflow.keras import layers
-from tensorflow.keras.applications.densenet import preprocess_input
+import torch
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from torchvision.datasets import ImageFolder
 
 from . import config
 
-AUTOTUNE = tf.data.AUTOTUNE
 
-# Keras preprocessing layers handle value ranges correctly (unlike hand-rolled
-# ops on a 0-255 image, where a ±0.1 brightness delta is invisible).
-_augment = tf.keras.Sequential(
-    [
-        layers.RandomRotation(0.03, fill_mode="constant"),        # ~±10 degrees
-        layers.RandomZoom(0.1, fill_mode="constant"),
-        layers.RandomTranslation(0.05, 0.05, fill_mode="constant"),
-        layers.RandomContrast(0.1),
-    ],
-    name="cxr_augment",
-)
+def _to_xrv_range(t):
+    """Map a [0, 1] tensor to TorchXRayVision's [-1024, 1024] range."""
+    return t * 2048.0 - 1024.0
 
 
-def _load(directory, shuffle):
-    if not directory.is_dir():
-        raise FileNotFoundError(f"Dataset folder not found: {directory}")
-    return tf.keras.utils.image_dataset_from_directory(
-        directory,
-        label_mode="categorical",
-        image_size=config.IMG_SIZE,
+def _transforms(train: bool):
+    steps = [
+        transforms.Grayscale(num_output_channels=1),
+        transforms.Resize(config.IMG_SIZE),
+        transforms.CenterCrop(config.IMG_SIZE),
+    ]
+    if train:
+        steps += [
+            transforms.RandomRotation(10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.9, 1.1)),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1),
+        ]
+    steps += [transforms.ToTensor(), transforms.Lambda(_to_xrv_range)]
+    return transforms.Compose(steps)
+
+
+def _loader(directory, train):
+    dataset = ImageFolder(str(directory), transform=_transforms(train))
+    return DataLoader(
+        dataset,
         batch_size=config.BATCH_SIZE,
-        shuffle=shuffle,
-        seed=config.SEED,
+        shuffle=train,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
     )
 
 
-def build_datasets():
-    """Return (train, val, test, class_names) datasets."""
-    # Quick sanity check: ensure the prepared train dir contains images
-    def _count_images_in_dir(directory):
-        counts = {}
-        for path in sorted(directory.iterdir()):
-            if not path.is_dir() or path.name.startswith("_"):
-                continue
-            n = sum(1 for p in path.rglob("*") if p.is_file() and p.suffix.lower() in config.IMAGE_SUFFIXES)
-            counts[path.name] = n
-        return counts
-
-    train_counts = _count_images_in_dir(config.TRAIN_DIR)
-    total_train = sum(train_counts.values())
-    if total_train == 0:
-        raise FileNotFoundError(
-            f"No images found in prepared train folder: {config.TRAIN_DIR}\n"
-            f"Check your CXR_DATA_ROOT or provide a pre-split dataset. Detected class folders: {list(train_counts.items())}"
-        )
-
-    train = _load(config.TRAIN_DIR, True)
-    val = _load(config.VAL_DIR, False)
-    test = _load(config.TEST_DIR, False)
-    class_names = train.class_names
-
-    def preprocess_fn(x, y):
-        return preprocess_input(x), y
-
-    def augment_fn(x, y):
-        x = tf.cast(x, tf.float32)
-        x = _augment(x, training=True)
-        x = tf.image.random_brightness(x, max_delta=15.0)
-        x = tf.clip_by_value(x, 0.0, 255.0)
-        return preprocess_input(x), y
-
-    train = train.map(augment_fn, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
-    val = val.map(preprocess_fn, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
-    test = test.map(preprocess_fn, num_parallel_calls=AUTOTUNE).prefetch(AUTOTUNE)
-
-    return train, val, test, class_names
+def build_loaders():
+    """Return (train_loader, val_loader, test_loader, class_names)."""
+    train_loader = _loader(config.TRAIN_DIR, train=True)
+    val_loader = _loader(config.VAL_DIR, train=False)
+    test_loader = _loader(config.TEST_DIR, train=False)
+    class_names = train_loader.dataset.classes   # alphabetical: matches ImageFolder indices
+    return train_loader, val_loader, test_loader, class_names
 
 
-def compute_class_weights(class_names):
-    """Inverse-frequency class weights from the training folder (handles imbalance)."""
+def class_weights(class_names):
+    """Inverse-frequency weights (× optional manual boost) as a float tensor."""
     counts = []
     for name in class_names:
         class_dir = config.TRAIN_DIR / name
-        n = sum(
-            1
-            for path in class_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in config.IMAGE_SUFFIXES
-        )
+        n = sum(1 for p in class_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in config.IMAGE_SUFFIXES)
         counts.append(max(n, 1))
     total = sum(counts)
     n_classes = len(counts)
-    weights = {i: total / (n_classes * c) for i, c in enumerate(counts)}
-    # Optional manual boost for classes the model under-predicts (see config).
+    weights = [total / (n_classes * c) for c in counts]
     for i, name in enumerate(class_names):
         weights[i] *= config.CLASS_WEIGHT_BOOST.get(name, 1.0)
-    return weights
+    return torch.tensor(weights, dtype=torch.float32)

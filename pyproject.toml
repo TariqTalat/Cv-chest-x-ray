@@ -1,20 +1,18 @@
 [project]
 name = "chest-xray-classifier"
-version = "0.1.0"
-description = "Chest X-ray classification with DenseNet121 (CheXNet-style)"
+version = "0.2.0"
+description = "Chest X-ray classification with a TorchXRayVision DenseNet121 backbone"
 readme = "README.md"
-# TensorFlow 2.10 (last native-Windows-GPU release) supports Python 3.7-3.10.
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.9"
 dependencies = [
-    "tensorflow==2.10.1",
-    # 0.31.0 is the last release with a Windows wheel (newer ones are Linux/macOS only).
-    "tensorflow-io-gcs-filesystem==0.31.0",
-    "numpy<1.24",
+    "torch",
+    "torchvision",
+    "torchxrayvision",
     "scikit-learn",
     "matplotlib",
     "seaborn",
+    "tqdm",
     "Pillow",
-    "tqdm>=4.68.3",
 ]
 
 # This is an application, not an importable library, so don't try to build/install it.
