@@ -48,7 +48,7 @@ def main():
     pipeline.plot_history(histories)
 
     if config.BEST_MODEL_PATH.exists():
-        model = tf.keras.models.load_model(config.BEST_MODEL_PATH)
+        model = tf.keras.models.load_model(config.BEST_MODEL_PATH, compile=False)
     pipeline.evaluate(model, test_ds, class_names)
 
 

@@ -95,4 +95,8 @@ def compute_class_weights(class_names):
         counts.append(max(n, 1))
     total = sum(counts)
     n_classes = len(counts)
-    return {i: total / (n_classes * c) for i, c in enumerate(counts)}
+    weights = {i: total / (n_classes * c) for i, c in enumerate(counts)}
+    # Optional manual boost for classes the model under-predicts (see config).
+    for i, name in enumerate(class_names):
+        weights[i] *= config.CLASS_WEIGHT_BOOST.get(name, 1.0)
+    return weights

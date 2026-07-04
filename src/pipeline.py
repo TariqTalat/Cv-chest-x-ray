@@ -5,7 +5,7 @@ Architecture is the proven CheXNet-style baseline: a DenseNet121 backbone
 small dataset is the *training recipe*, not head complexity:
 
   Phase 1  warm up the head with the backbone frozen (high LR).
-  Phase 2  fine-tune the last two dense blocks with a low, cosine-decayed LR.
+  Phase 2  fine-tune the last dense blocks with a low, cosine-decayed LR.
 
 Backbone BatchNorm always runs in inference mode (``training=False``), so its
 ImageNet running statistics stay frozen even while conv weights are fine-tuned —
@@ -58,11 +58,22 @@ def unfreeze(base, from_block=config.FINE_TUNE_FROM):
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
+def categorical_focal_loss(gamma):
+    """Softmax focal loss — down-weights easy examples (1 - p)^gamma so training
+    focuses on the hard, misclassified cases instead of coasting on easy ones."""
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, y_pred.dtype)
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        ce = -y_true * tf.math.log(y_pred)
+        return tf.reduce_sum(tf.pow(1.0 - y_pred, gamma) * ce, axis=-1)
+    return loss
+
+
 def _compile(model, lr):
     """Accuracy + macro AUC. Per-class precision/recall come from evaluate()."""
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=config.LABEL_SMOOTHING),
+        loss=categorical_focal_loss(config.FOCAL_GAMMA),
         metrics=["accuracy", tf.keras.metrics.AUC(name="auc", multi_label=True)],
     )
 
@@ -70,10 +81,13 @@ def _compile(model, lr):
 def _callbacks(phase):
     """One learning-rate controller per phase — never a scheduler *and* a plateau reducer."""
     config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    # Monitor val AUC (not val_loss): threshold-free and robust to label
+    # smoothing, so fine-tuning isn't cut short by a noisy loss curve.
     cbs = [
-        cb.ModelCheckpoint(str(config.BEST_MODEL_PATH), monitor="val_loss",
-                           mode="min", save_best_only=True, verbose=0),
-        cb.EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True, verbose=1),
+        cb.ModelCheckpoint(str(config.BEST_MODEL_PATH), monitor="val_auc",
+                           mode="max", save_best_only=True, verbose=0),
+        cb.EarlyStopping(monitor="val_auc", mode="max", patience=10,
+                         restore_best_weights=True, verbose=1),
         TqdmCallback(verbose=1),
     ]
     if phase == "finetune":
@@ -98,7 +112,7 @@ def train(model, base, train_ds, val_ds, finetune=True, class_weight=None):
     histories = [_fit(model, train_ds, val_ds, config.EPOCHS_FROZEN, "frozen", class_weight)]
 
     if finetune:
-        print("\n" + "=" * 70 + "\n=== Phase 2: Fine-tuning the backbone (conv4 + conv5) ===\n" + "=" * 70)
+        print("\n" + "=" * 70 + f"\n=== Phase 2: Fine-tuning the backbone (from {config.FINE_TUNE_FROM}) ===\n" + "=" * 70)
         unfreeze(base)
         _compile(model, config.LR_FINETUNE)
         histories.append(_fit(model, train_ds, val_ds, config.EPOCHS_FINETUNE, "finetune", class_weight))
@@ -138,15 +152,15 @@ def plot_history(histories):
 def evaluate(model, test_ds, class_names):
     """Evaluate on the test set; write report + confusion matrix to outputs/."""
     config.OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    loss, acc = model.evaluate(test_ds, verbose=0)[:2]
-    print(f"\nTest accuracy: {acc:.4f}   loss: {loss:.4f}")
-
     y_true = np.concatenate([y.numpy() for _, y in test_ds]).argmax(1)
     y_pred = model.predict(test_ds, verbose=0).argmax(1)
+    acc = float((y_true == y_pred).mean())
+    print(f"\nTest accuracy: {acc:.4f}")
+
     report = classification_report(y_true, y_pred, target_names=class_names, digits=4)
     print("\n" + report)
     (config.OUTPUTS_DIR / "classification_report.txt").write_text(
-        f"Test accuracy: {acc:.4f}\nTest loss: {loss:.4f}\n\n{report}", encoding="utf-8")
+        f"Test accuracy: {acc:.4f}\n\n{report}", encoding="utf-8")
 
     sns.heatmap(confusion_matrix(y_true, y_pred), annot=True, fmt="d", cmap="Blues",
                 xticklabels=class_names, yticklabels=class_names)
